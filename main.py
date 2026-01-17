@@ -4,72 +4,83 @@ import os
 import glob
 
 
-# ==========================================
-# ETAP 7: WSTĘPNE PRZETWARZANIE OBRAZU
-# ==========================================
+
+# PRZETWARZANIE WSTĘPNE
+
 def preprocess_signature(path):
-    # 7.1. Konwersja do skali szarości
+    """Przygotowuje obraz do ekstrakcji cech."""
+    # w skali szarości
     img_gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img_gray is None:
         return None
 
-    # 7.2. Binaryzacja Otsu z odwróceniem (podpis biały, tło czarne)
+    # Binaryzacja
     _, img_bin = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 7.3. Redukcja szumów filtrem medianowym
+    # Redukcja szumów
     img_bin = cv2.medianBlur(img_bin, 3)
 
-    # 7.4. Normalizacja - wykadrowanie do obszaru podpisu
+    # Normalizacja do obszaru podpisu - Bounding Box
     coords = cv2.findNonZero(img_bin)
     if coords is None:
         return None
     x, y, w, h = cv2.boundingRect(coords)
     cropped = img_bin[y:y + h, x:x + w]
 
-    # Resize do stałego wymiaru (ujednolicenie danych do wektora cech)
-    return cv2.resize(cropped, (300, 150), interpolation=cv2.INTER_AREA)
+    return cropped
 
 
-# ==========================================
-# ETAP 8: EKSTRAKCJA CECH BIOMETRYCZNYCH
-# ==========================================
+
+# EKSTRAKCJA CECH
+
 def extract_biometric_features(img):
-    if img is None: return None
+    """Ekstrahuje cechy zdefiniowane w specyfikacji."""
+    if img is None:
+        return None
 
     h, w = img.shape
-    # 8.2.1. Pole powierzchni (liczba białych pikseli)
+
+    # Pole powierzchni podpisu - liczba pikseli należących do podpisu (białych)
     area = cv2.countNonZero(img)
-    # 8.2.2. Proporcje (szerokość / wysokość)
-    aspect_ratio = w / float(h)
-    # 8.2.3. Liczba konturów
+
+    # Proporcje - stosunek szerokości do wysokości
+    aspect_ratio = w / float(h) if h != 0 else 0
+
+    # Liczba konturów - liczba odrębnych fragmentów podpisu
+    # RETR_EXTERNAL znajduje tylko zewnętrzne obrysy (pomija dziury wewnątrz liter)
     contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     num_contours = len(contours)
-    # 8.2.4. Gęstość pikseli
-    density = area / float(w * h)
 
-    # 8.3. Budowa wektora cech
+    # Gęstość pikseli - pole powierzchni podzielone przez rozmiar prostokąta
+    density = area / float(w * h) if (w * h) != 0 else 0
+
+    # Zwracamy wektor cech
     return np.array([area, aspect_ratio, num_contours, density])
 
 
-# ==========================================
-# ETAP 9 & 10: MODEL I WERYFIKACJA
-# ==========================================
+
+# MODEL I ANALIZA
+
 def get_model_parameters(reference_paths):
-    """Tworzy uśredniony wzorzec i parametry normalizacji"""
+    """Tworzy uśredniony wzorzec i parametry normalizacji."""
     ref_vectors = []
     for p in reference_paths:
-        feat = extract_biometric_features(preprocess_signature(p))
+        processed = preprocess_signature(p)
+        feat = extract_biometric_features(processed)
         if feat is not None:
             ref_vectors.append(feat)
 
-    if not ref_vectors: return None, None, None
+    if not ref_vectors:
+        return None, None, None
 
     ref_matrix = np.array(ref_vectors)
     mean_val = np.mean(ref_matrix, axis=0)
     std_val = np.std(ref_matrix, axis=0)
-    std_val[std_val == 0] = 1.0  # Unikanie dzielenia przez zero
 
-    # Normalizacja wzorców i stworzenie szablonu (template)
+    # Zabezpieczenie przed dzieleniem przez zero
+    std_val[std_val == 0] = 1.0
+
+    # Normalizacja wzorców i stworzenie szablonu (uśredniony podpis)
     normalized_refs = (ref_matrix - mean_val) / std_val
     template = np.mean(normalized_refs, axis=0)
 
@@ -77,20 +88,22 @@ def get_model_parameters(reference_paths):
 
 
 def calculate_metrics(template, mean_v, std_v, ref_paths, target_name, threshold):
-    """Oblicza FAR/FRR dla danej osoby (wymaga plików 'falsz_*.png')"""
-    # FRR: Sprawdzamy jak wiele wzorców zostałoby odrzuconych przez własny model
+    """Oblicza FAR (False Acceptance Rate) i FRR (False Rejection Rate)."""
+    # FRR: Fałszywe odrzucenia (własne podpisy odrzucone)
     false_rejections = 0
     for p in ref_paths:
-        feat = extract_biometric_features(preprocess_signature(p))
+        processed = preprocess_signature(p)
+        feat = extract_biometric_features(processed)
         dist = np.linalg.norm(((feat - mean_v) / std_v) - template)
         if dist > threshold:
             false_rejections += 1
 
-    # FAR: Szukamy plików fałszywych (np. 'bieber_falsz1.png')
+    # FAR: Fałszywe akceptacje (podrobione podpisy zaakceptowane)
     forgery_paths = glob.glob(f"{target_name}_falsz*.png")
     false_acceptances = 0
     for p in forgery_paths:
-        feat = extract_biometric_features(preprocess_signature(p))
+        processed = preprocess_signature(p)
+        feat = extract_biometric_features(processed)
         if feat is not None:
             dist = np.linalg.norm(((feat - mean_v) / std_v) - template)
             if dist <= threshold:
@@ -101,52 +114,77 @@ def calculate_metrics(template, mean_v, std_v, ref_paths, target_name, threshold
     return far, frr
 
 
-# ==========================================
-# INTERAKTYWNA KONSOLA UŻYTKOWNIKA
-# ==========================================
-def run_app():
-    print("==============================================")
-    print("   SYSTEM BIOMETRYCZNEJ WERYFIKACJI PODPISU   ")
-    print("==============================================")
 
-    threshold = 1.2  # Stały próg decyzyjny
+def run_app():
+    print("----------------------------------------------")
+    print("   SYSTEM BIOMETRYCZNEJ WERYFIKACJI PODPISU   ")
+    print("----------------------------------------------")
+
+    # Ustalanie progu na starcie
+    while True:
+        try:
+            t = input("\nPodaj prog decyzyjny (ENTER = 1.2): ").strip()
+            threshold = float(t) if t else 1.2
+            break
+        except ValueError:
+            print("Blad: prog musi byc liczba.")
 
     while True:
-        target = input("\nPodaj nazwę osoby (np. 'bieber') lub 'q' aby wyjść: ").strip().lower()
-        if target == 'q': break
+        target = input(
+            "\nPodaj nazwe osoby | 't' - zmien prog | 'x' - wyjscie: "
+        ).strip().lower()
 
-        # Automatyczne dopasowanie plików
+        if target == 'x':
+            break
+
+        if target == 't':
+            try:
+                t = input("Nowy prog decyzyjny: ").strip()
+                threshold = float(t)
+                print(f"Ustawiono nowy prog: {threshold}")
+            except ValueError:
+                print("Blad: prog musi byc liczba.")
+            continue
+
         ref_paths = glob.glob(f"{target}_ref*.png")
         test_path = f"{target}_test.png"
 
         if not ref_paths or not os.path.exists(test_path):
-            print(f"❌ Błąd: Brak plików. Wymagane: {target}_ref1.png oraz {target}_test.png")
+            print(f"Blad: Brak plikow. Wymagane: {target}_ref1.png oraz {target}_test.png")
             continue
 
-        # 1. Budowa modelu wzorcowego
         template, mean_v, std_v = get_model_parameters(ref_paths)
 
-        # 2. Analiza podpisu testowego
-        test_feat = extract_biometric_features(preprocess_signature(test_path))
+        test_processed = preprocess_signature(test_path)
+        test_feat = extract_biometric_features(test_processed)
+
         if test_feat is not None:
-            # Normalizacja i obliczenie odległości euklidesowej
             norm_test = (test_feat - mean_v) / std_v
             distance = np.linalg.norm(norm_test - template)
 
-            # 3. Decyzja i statystyki
             print(f"\nWyniki dla: {target.upper()}")
-            print(f"----------------------------------------------")
+            print("-" * 46)
+
             if distance <= threshold:
-                print(f"✅ STATUS: PODPIS AUTENTYCZNY")
+                print("PODPIS AUTENTYCZNY")
             else:
-                print(f"❌ STATUS: PODPIS FAŁSZYWY (PRÓBA OSZUSTWA)")
+                print("PODPIS FALSZYWY")
 
-            print(f"📊 Odległość biometryczna: {distance:.4f}")
+            print(f"Odleglosc biometryczna: {distance:.4f}")
+            print(f"Prog decyzyjny: {threshold}")
 
-            # Opcjonalne FAR/FRR
-            far, frr = calculate_metrics(template, mean_v, std_v, ref_paths, target, threshold)
-            print(f"📈 Skuteczność lokalna: FAR: {far:.1f}% | FRR: {frr:.1f}%")
-            print(f"----------------------------------------------")
+            print(f"   - Pole: {test_feat[0]:.0f} px")
+            print(f"   - Proporcje: {test_feat[1]:.2f}")
+            print(f"   - Kontury: {test_feat[2]:.0f}")
+            print(f"   - Gestosc: {test_feat[3]:.4f}")
+
+            far, frr = calculate_metrics(
+                template, mean_v, std_v, ref_paths, target, threshold
+            )
+
+            print(f"Skutecznosc: FAR: {far:.1f}% | FRR: {frr:.1f}%")
+            print("-" * 46)
+
 
 
 if __name__ == "__main__":
